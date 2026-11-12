@@ -6,6 +6,8 @@ services:
       UPSTREAM_PORT: "8000"
       LISTEN_HOST: 0.0.0.0
       LISTEN_PORT: "8080"
+      # 建连前可控延迟（秒），默认 0；仅用于编排“慢建连 + 断连交错”回归演示。
+      UPSTREAM_CONNECT_DELAY: "${UPSTREAM_CONNECT_DELAY:-0}"
       LOG_LEVEL: INFO
     ports:
       - "8080:8080"

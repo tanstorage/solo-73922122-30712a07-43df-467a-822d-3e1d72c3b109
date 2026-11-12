@@ -7,6 +7,9 @@ HTTP/1.1 反向代理（asyncio + h11，单进程）
     校验通过后丢弃原始分帧，重建单一 Content-Length 再转发；
   * 固定上游，连接池容量 2，每条连接同一时刻只处理一笔；
   * 从发送起总限 2 秒；超时 / 客户端断连即销毁上游连接，迟到响应不会交给下一调用者；
+  * 客户端在“等待名额 / 建连中 / 建连完成交接”任一时点断连，本次获取都立即
+    结束：未发送的上报绝不继续转发，占用的名额准确归还且不重复释放，后续正常
+    上报无需重启即可继续；
   * 只有完整收齐带 Content-Length 的响应才把连接归还连接池。
 
 h11 是 sans-IO 解析器：它只负责字节 <-> 事件，所有 IO 与策略由本模块实现。
@@ -38,6 +41,8 @@ READ_BLOCK = 65536
 
 UPSTREAM_HOST = os.environ.get("UPSTREAM_HOST", "upstream")
 UPSTREAM_PORT = int(os.environ.get("UPSTREAM_PORT", "8000"))
+# 建连前可控延迟（秒），用于在慢建连场景下编排断连交错回归；默认 0 不影响生产。
+UPSTREAM_CONNECT_DELAY = float(os.environ.get("UPSTREAM_CONNECT_DELAY", "0"))
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "8080"))
 
@@ -90,6 +95,9 @@ class UpstreamConn:
     conn: h11.Connection
     busy: bool = False
     closed: bool = False
+    # 名额是否已被扣减（仅在连接销毁的 _free_slot 中置位）。
+    # 健康连接的多次 release 不改变该标志，保证复用路径不重复记账。
+    slot_freed: bool = False
     requests_served: int = 0
 
     def close(self) -> None:
@@ -109,12 +117,26 @@ class UpstreamConn:
 
 
 class UpstreamPool:
-    """容量固定为 2 的上游连接池；每条连接由 busy 保证同一时刻仅处理一笔。"""
+    """容量固定为 2 的上游连接池；每条连接由 busy 保证同一时刻仅处理一笔。
 
-    def __init__(self, host: str, port: int, capacity: int = POOL_CAPACITY):
+    名额（``_active``）的记账规则：
+      * ``_take_slot`` 决定新建时预占一个名额；
+      * 建连成功且连接交接给调用方后，该名额由连接对象持有；健康连接每次
+        成功交换后可被多次 ``release`` 回池复用，名额始终只算一次；
+      * 名额的真正扣减只发生在 ``_free_slot``（连接销毁），每条连接至多一次
+        （``slot_freed`` 保证幂等），因此重复销毁 / 释放不会重复扣名额；
+      * 建连失败、或建连协程在等待期间被取消（客户端断连），名额当场归还，
+        任何已建成的半成品连接立即销毁，绝不回流池内。
+    """
+
+    def __init__(self, host: str, port: int, capacity: int = POOL_CAPACITY,
+                 connector=None, connect_delay: float = UPSTREAM_CONNECT_DELAY):
         self._host = host
         self._port = port
         self._capacity = capacity
+        # 可注入的建连函数，便于回归测试精确控制“建连变慢 / 建连完成时点”。
+        self._connector = connector or asyncio.open_connection
+        self._connect_delay = connect_delay
         self._idle: list[UpstreamConn] = []
         self._active = 0
         self._cond = asyncio.Condition()
@@ -130,18 +152,47 @@ class UpstreamPool:
                     return uc
                 await self.destroy(uc)  # 死连接销毁并补名额，继续尝试
                 continue
-            # 无空闲连接且池未满：在锁外新建，避免慢连接阻塞条件变量。
+
+            # 无空闲连接且池未满：名额已在 _take_slot 中预占。
+            # 慢建连期间本协程可能因客户端断连被取消，所有出口都必须
+            # 准确归还名额；半成品连接必须销毁，不能让后续转发拿到它。
+            reader = writer = None
             try:
-                reader, writer = await asyncio.open_connection(
+                if self._connect_delay:
+                    await asyncio.sleep(self._connect_delay)
+                reader, writer = await self._connector(
                     self._host, self._port)
-            except OSError as exc:
-                async with self._cond:
-                    self._active -= 1
-                    self._cond.notify()
-                raise UpstreamError(f"connect upstream failed: {exc}") from exc
+            except asyncio.CancelledError:
+                await self._abort_new_connection(reader, writer)
+                raise
+            except BaseException as exc:
+                await self._abort_new_connection(reader, writer)
+                if isinstance(exc, OSError):
+                    raise UpstreamError(
+                        f"connect upstream failed: {exc}") from exc
+                raise
             return UpstreamConn(reader, writer, h11.Connection(h11.CLIENT),
                                 busy=True)
         raise UpstreamError("pool exhausted while recovering dead connections")
+
+    async def _abort_new_connection(
+        self,
+        reader: Optional[asyncio.StreamReader],
+        writer: Optional[asyncio.StreamWriter],
+    ) -> None:
+        """建连失败 / 被取消后的统一清理：销毁半成品连接并归还预占名额。"""
+        if writer is not None:
+            # abort() 立即关闭底层 socket，避免慢建连取消后留下半开连接
+            # 与未回收的 transport（close() 仍会尝试 flush 缓冲）。
+            if writer.transport is not None and not writer.is_closing():
+                writer.transport.abort()
+            try:
+                writer.close()
+            except OSError:
+                pass
+        async with self._cond:
+            self._active -= 1
+            self._cond.notify()
 
     async def _take_slot(self) -> Optional[UpstreamConn]:
         async with self._cond:
@@ -154,21 +205,41 @@ class UpstreamPool:
                 await self._cond.wait()
 
     async def release(self, uc: UpstreamConn) -> None:
-        """完整成功交换后归还；损坏 / 已关闭的连接直接销毁。"""
+        """完整成功交换后归还；损坏 / 已关闭的连接直接销毁。
+
+        幂等语义：``release`` 是“归还复用”，同一条健康连接在其生命周期内
+        会被多次 release（每次成功交换后一次），名额始终由它持有、不重复计数；
+        真正的名额扣减只发生在 ``_free_slot``（连接销毁）时，且每条连接
+        至多一次，杜绝重复释放。
+        """
         uc.busy = False
         if uc.closed:
-            async with self._cond:
-                self._active -= 1
-                self._cond.notify()
+            await self._free_slot(uc)
             return
         async with self._cond:
-            self._idle.append(uc)
+            if uc.slot_freed:
+                # 已走销毁路径的连接绝不回流空闲池。
+                return
+            if uc not in self._idle:
+                self._idle.append(uc)
             self._cond.notify()
 
     async def destroy(self, uc: UpstreamConn) -> None:
-        """失败路径：销毁连接并腾出池名额。"""
+        """失败路径：销毁连接并腾出池名额。重复调用安全且只生效一次。"""
         uc.close()
+        await self._free_slot(uc)
+
+    async def _free_slot(self, uc: UpstreamConn) -> None:
+        """唯一的名额扣减点：每条连接至多扣一次，防止重复释放。"""
         async with self._cond:
+            if uc.slot_freed:
+                return
+            uc.slot_freed = True
+            # 若连接此刻还挂在空闲池里（理论上不应发生），先摘除再扣名额。
+            try:
+                self._idle.remove(uc)
+            except ValueError:
+                pass
             self._active -= 1
             self._cond.notify()
 
@@ -176,7 +247,11 @@ class UpstreamPool:
         async with self._cond:
             for uc in self._idle:
                 uc.close()
+                if not uc.slot_freed:
+                    uc.slot_freed = True
+                    self._active -= 1
             self._idle.clear()
+            self._cond.notify_all()
 
 
 # --------------------------------------------------------------------------- #
@@ -617,22 +692,59 @@ class InboundProtocol(asyncio.Protocol):
     # ---- 转发 ------------------------------------------------------------- #
 
     async def _acquire_abortable(self) -> UpstreamConn:
-        """获取上游连接；等待期间客户端断连则立即中止，不再占用池名额。"""
+        """获取上游连接，客户端在任一阶段断连都立即中止本次获取。
+
+        三个断连时点全部覆盖：
+          1. 等待池名额：``acquire`` 卡在条件变量上，取消即可，名额从未预占；
+          2. 建连中：``acquire`` 卡在 open_connection 上，取消后由池统一
+             销毁半成品连接并归还名额，不会泄漏；
+          3. 建连完成与断连同拍（交接点）：``acquire`` 已经把新连接交接出来，
+             此时若客户端已不在，必须当场销毁该连接并放弃上报，
+             绝不能带着一个“已放弃的请求”继续向上游发送。
+        """
         acquired = asyncio.create_task(self._pool.acquire())
         closed = asyncio.create_task(self._closed_event.wait())
         try:
-            await asyncio.wait({acquired, closed}, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait({acquired, closed},
+                               return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
             acquired.cancel()
             closed.cancel()
             raise
+        finally:
+            if not closed.done():
+                closed.cancel()
+
+        client_gone = self._closed_event.is_set()
+
         if not acquired.done():
+            # 时点 1/2：获取尚未结束（等名额或建连中），取消并由池清理名额。
             acquired.cancel()
-            raise ClientGone("client closed while waiting for upstream slot")
-        closed.cancel()
+            await _silent_await_cancel(acquired)
+            if client_gone:
+                raise ClientGone(
+                    "client closed while waiting for upstream connection")
+            # 理论不可达：两任务都未完成。防御性向上传播取消。
+            raise UpstreamError("upstream acquire aborted without result")
+
+        # 获取已完成：无论成败都先取回，避免未取异常告警。
         if acquired.exception() is not None:
-            raise UpstreamError(str(acquired.exception()))
-        return acquired.result()
+            exc = acquired.exception()
+            if client_gone:
+                raise ClientGone(
+                    "client closed during upstream acquire") from exc
+            if isinstance(exc, UpstreamError):
+                raise exc
+            raise UpstreamError(str(exc)) from exc
+
+        uc = acquired.result()
+        if client_gone:
+            # 时点 3：连接刚建好、尚未发送任何上报字节，客户端已经断连。
+            # 销毁连接并归还名额；本次上报到此结束，绝不继续转发。
+            await self._pool.destroy(uc)
+            raise ClientGone(
+                "client closed right when upstream connection completed")
+        return uc
 
     async def _forward(
         self,
@@ -646,6 +758,13 @@ class InboundProtocol(asyncio.Protocol):
 
         for attempt in (1, 2):
             uc = await self._acquire_abortable()
+            # 排队等待名额期间 closed 竞速任务已被取消，必须在真正占用连接、
+            # 发送任何上游字节之前再查一次断连标志：否则“等名额时掉线”的请求
+            # 会在拿到名额后被照常转发（已放弃上报泄漏到上游）。
+            if self._closed_event.is_set():
+                await self._pool.destroy(uc)
+                raise ClientGone(
+                    "client closed while queued for upstream slot")
             exchange_task = asyncio.create_task(exchange_upstream(
                 self._pool, uc, b"POST", b"/events", headers, body))
             closed_task = asyncio.create_task(self._closed_event.wait())
